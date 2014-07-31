@@ -308,3 +308,19 @@ func (cfg *CFG) GetOption(name string) (string, bool) {
 	}
 	return "", false
 }
+
+//Get option value if exists. If it doesn't or it cannot be retrieved for some reason, return default value
+func (cfg *CFG) GetValue(name string, defaultValue string) string {
+	if v, ok := cfg.GetOption(name); ok {
+		return v
+	}
+	return defaultValue
+}
+
+//Get option value as string array if exists. If it doesn't or it cannot be retrieved for some reason, return default value
+func (cfg *CFG) GetValueArray(name string, defaultValue []string) []string {
+	if v, ok := cfg.GetOptionArray(name); ok {
+		return v
+	}
+	return defaultValue
+}

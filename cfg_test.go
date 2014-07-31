@@ -30,11 +30,25 @@ func TestSplitPath(t *testing.T) {
 
 func TestSetOptionString(t *testing.T) {
 	cfg := NewCFG()
-	if err := cfg.SetOption("op1", "val1", ""); err != nil {
-		t.Error(err)
+	for _, val := range []string{"val1", "val2"} {
+		if err := cfg.SetOption("/op1", val, ""); err != nil {
+			t.Error(err)
+		}
+		if rval, ok := cfg.GetOption("op1"); !ok || val != rval {
+			t.Error("Could not retrieve op1 or val was different than expected (" + rval + " vs " + val + ")")
+		}
 	}
-	if val, ok := cfg.GetOption("op1"); !ok || val != "val1" {
-		t.Error("Could not retrieve op1 or val was different than expected (" + val + ")")
+	if err := cfg.SetOption("nop/as", "ASD", ""); err == nil {
+		t.Error("Allowed to set an option with inexistant parent section")
+	}
+	if err := cfg.SetOption("", "ASD", ""); err == nil {
+		t.Error("Allowed to set an option with inexistant name")
+	}
+	if d := cfg.GetValue("", "DEF"); d != "DEF" {
+		t.Error("Didn't get default value")
+	}
+	if d := cfg.GetValueArray("", []string{"DEF"}); len(d) != 1 || d[0] != "DEF" {
+		t.Error("Didn't get default value")
 	}
 }
 
