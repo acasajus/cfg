@@ -2,7 +2,6 @@ package cfg
 
 import (
 	"fmt"
-	"os"
 	"testing"
 )
 
@@ -18,6 +17,8 @@ func equalSlices(a, b []string) bool {
 	return true
 }
 
+/* Start tests */
+
 func TestSplitPath(t *testing.T) {
 	expected := []string{"a", "b", "c"}
 	for _, source := range []string{"a/b/c", "/a/b/c", "//a/b/c", "a/b/c/", "////a////b//c/////"} {
@@ -25,6 +26,65 @@ func TestSplitPath(t *testing.T) {
 		if !equalSlices(res, expected) {
 			t.Fatal(fmt.Sprintf("Unexpected split: %v expected %v", res, expected))
 		}
+	}
+}
+
+func TestLoadErrors(t *testing.T) {
+	data := "a = 1\na {\nop = 1\n}"
+	expected := "Section a defined under / is already defined (line 2)"
+	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
+		t.Error("Didn't receive expected error: ", err)
+	}
+	data = "a { crap\n}"
+	expected = "Expected inheriting section defined with '< section_name' but 'crap' found (line 1)"
+	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
+		t.Error("Didn't receive expected error: ", err)
+	}
+	data = "a=1\na=1"
+	expected = "a already exists (line 2)"
+	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
+		t.Error("Didn't receive expected error: ", err)
+	}
+	data = "a=1\nb+=1"
+	expected = "Option b was not previously defined (line 2)"
+	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
+		t.Error("Didn't receive expected error: ", err)
+	}
+	data = "s{\na=1\nb+=1\n"
+	expected = "Option b was not previously defined (line 3)"
+	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
+		t.Error("Didn't receive expected error: ", err)
+	}
+	data = "s{\n}\ns2{<a\n}"
+	expected = "Inheritance section a for section s2 does not exist"
+	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
+		t.Error("Didn't receive expected error: ", err)
+	}
+	data = "s1{<s3\n}\ns2{\ns21{<s1\n}\n}\ns3{<s2/s21\n}"
+	expected = "Circular inheritance loop found: s3 < s2/s21 < s1 < s3"
+	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
+		t.Error("Didn't receive expected error: ", err)
+	}
+}
+
+func TestLoadDump(t *testing.T) {
+	var err error
+	var cfg, cfg2 *CFG
+	data := "s1 {< s3\n}\ns2 {\n\ts21 {< s1\n\t\top1 = a\n\t\top1 += b\n\t}\n}\n#Stupid comment\ns3 {< s2\n}\n"
+	cfg, err = NewCFGFromString(data)
+	if err != nil {
+		t.Error("Error wile loading CFG: " + err.Error())
+	}
+	out := cfg.String()
+	if out != data {
+		t.Error("Re dump differs from original dump")
+	}
+	cfg2, err = NewCFGFromString(data)
+	if err != nil {
+		t.Error("Error wile loading CFG: " + err.Error())
+	}
+	if out != cfg2.String() {
+		t.Error("Re dump differs from original dump")
 	}
 }
 
@@ -52,15 +112,68 @@ func TestSetOptionString(t *testing.T) {
 	}
 }
 
-func TestLoadFromReader(t *testing.T) {
-	fi, err := os.Open("example.cfg")
-	if err != nil {
-		panic(err)
+func TestFromFile(t *testing.T) {
+	_, err := NewCFGFromFile("nonexistantfile")
+	if err == nil {
+		t.Error("Didn't complain when opening a non existant file")
 	}
-	defer fi.Close()
-	cfg, err := NewCFGFromReader(fi)
+	cfg, err := NewCFGFromFile("example.cfg")
 	if err != nil {
 		t.Error(err)
 	}
 	cfg.Root()
+}
+
+func TestCloneEqual(t *testing.T) {
+	data := "s1 {\nop1 = val1\nop1 += val1a\n}\ns2 {<s1\ns21{<s2\nop211=val211\n}\ns22{\n}\n}\nop1=a"
+	cfg, err := NewCFGFromString(data)
+	if err != nil {
+		t.Error(err)
+	}
+	dup, err := cfg.Clone()
+	if err != nil {
+		t.Error(err)
+	}
+	if !dup.Equal(cfg) {
+		t.Error("Not equal!")
+	}
+}
+
+func TestExists(t *testing.T) {
+	data := "s1 {\nop1 = val1\nop1 += val1a\n}\ns2 {<s1\ns21{<s2\nop211=val211\n}\ns22{\n}\n}\nop1=a"
+	cfg, err := NewCFGFromString(data)
+	if err != nil {
+		t.Error("Error wile loading CFG: " + err.Error())
+	}
+	if !cfg.Exists("s1") {
+		t.Error("Section doesn't exist")
+	}
+	if cfg.ExistsOption("s1") {
+		t.Error("Section exists as option")
+	}
+	if !cfg.ExistsSection("s1") {
+		t.Error("Section doesn't exist as section")
+	}
+	if !cfg.Exists("s2/s21") {
+		t.Error("Section doesn't exist")
+	}
+	if cfg.Exists("s2/s31") {
+		t.Error("Section exists")
+	}
+	if cfg.Exists("s0") {
+		t.Error("Section exists")
+	}
+	if !cfg.Exists("s2/s21/s22") {
+		t.Error("Section does not exist")
+	}
+	if !cfg.Exists("s1/op1") {
+		t.Error("Option doesn't exist")
+	}
+	if !cfg.Exists("s2/s21/op1") {
+		t.Error("Option doesn't exist")
+	}
+	if !cfg.ExistsOption("op1") {
+		t.Error("Option doesn't exist")
+	}
+
 }

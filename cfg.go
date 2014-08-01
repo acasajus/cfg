@@ -3,9 +3,11 @@ package cfg
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 )
@@ -20,23 +22,43 @@ type option struct {
 
 //This is a container of a cfg section. A full cfg file can be included in one *CFG and it's children
 type CFG struct {
-	root        *CFG
 	inheritance *CFG
 	parent      *CFG
 	options     map[string]*option
 	sections    map[string]*CFG
 	order       []string
 	comment     string
-	lock        sync.Mutex
+	lock        *sync.Mutex
 }
 
 //Create a new *CFG
 func NewCFG() (cfg *CFG) {
+	cfg = newCFG()
+	cfg.lock = new(sync.Mutex)
+	return
+}
+
+func newCFG() (cfg *CFG) {
 	cfg = new(CFG)
 	cfg.options = make(map[string]*option)
 	cfg.sections = make(map[string]*CFG)
 	cfg.order = make([]string, 0)
 	return
+}
+
+//Create a new *CFG loading the contents from a filename
+func NewCFGFromFile(filename string) (cfg *CFG, err error) {
+	fi, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer fi.Close()
+	return NewCFGFromReader(fi)
+}
+
+//Create a new *CFG loading the contents from a string
+func NewCFGFromString(data string) (*CFG, error) {
+	return NewCFGFromReader(strings.NewReader(data))
 }
 
 //Create a new *CFG loading the contents from the io.Reader
@@ -62,16 +84,133 @@ func SplitPath(path string) []string {
 }
 
 /* GFC funcs */
+
+//Stringer interface
+func (cfg *CFG) String() string {
+	var b bytes.Buffer
+	err := cfg.DumpToWriter(&b)
+	if err == nil {
+		return b.String()
+	}
+	return ""
+}
+
+//Dump
+func (cfg *CFG) DumpToWriter(w io.Writer) error {
+	return cfg.dumpToWriter(w, 0)
+}
+
+func (cfg *CFG) dumpCommentToWriter(w io.Writer, comment string, indent string) error {
+	if comment == "" {
+		return nil
+	}
+	for _, cl := range strings.Split(comment, "\n") {
+		if len(cl) > 0 {
+			line := indent + "#" + cl + "\n"
+			if _, err := w.Write([]byte(line)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+
+}
+
+func (cfg *CFG) dumpToWriter(w io.Writer, indent_lvl int) error {
+	indent := strings.Repeat("\t", indent_lvl)
+	var line string
+	for _, name := range cfg.order {
+		//Dump the section
+		if sec, ok := cfg.sections[name]; ok {
+			if err := cfg.dumpCommentToWriter(w, sec.comment, indent); err != nil {
+				return err
+			}
+			line = indent + name + " {"
+			if sec.inheritance != nil {
+				line += "< " + sec.inheritance.Path()
+			}
+			if _, err := w.Write([]byte(line + "\n")); err != nil {
+				return err
+			}
+			if err := sec.dumpToWriter(w, indent_lvl+1); err != nil {
+				return err
+			}
+			line = indent + "}" + "\n"
+			if _, err := w.Write([]byte(line)); err != nil {
+				return err
+			}
+		}
+		if opt, ok := cfg.options[name]; ok {
+			if err := cfg.dumpCommentToWriter(w, opt.comment, indent); err != nil {
+				return err
+			}
+			for nV, val := range opt.value {
+				if nV == 0 {
+					line = indent + name + " = " + val + "\n"
+				} else {
+					line = indent + name + " += " + val + "\n"
+				}
+				if _, err := w.Write([]byte(line)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+//load the contents of a reader into this CFG. This method fails if something gets overwritten
+func (cfg *CFG) LoadFromReader(r io.Reader) (err error) {
+	inheritance_map := make(map[*CFG]string)
+	err = cfg.loadFromReader(bufio.NewReader(r), 0, inheritance_map)
+	if err != nil {
+		return
+	}
+	cfg.resetInheritance()
+	for child, inheritance := range inheritance_map {
+		if err = child.SetInheritance(inheritance); err != nil {
+			return
+		}
+	}
+	return
+}
+
+//Reset all inheritance pointers for this cfg and child ones
+func (cfg *CFG) resetInheritance() {
+	cfg.inheritance = nil
+	for _, subCFG := range cfg.sections {
+		subCFG.resetInheritance()
+	}
+}
+
+//Define an inheritance section for this cfg. That means that any time that an option or section is retrieved, if this cfg does not have it it will check the inheritance one
+func (cfg *CFG) SetInheritance(inheritance string) error {
+	incfg, _ := cfg.Root().getString(inheritance, false, 0)
+	myPath := cfg.Path()
+	if incfg == nil {
+		return errors.New(fmt.Sprintf("Inheritance section %s for section %s does not exist", inheritance, myPath))
+	}
+	cfg.inheritance = incfg
+	path := []string{myPath, incfg.Path()}
+	search := incfg.inheritance
+	for search != nil {
+		path = append(path, search.Path())
+		if search == cfg {
+			return errors.New("Circular inheritance loop found: " + strings.Join(path, " < "))
+		}
+		search = search.inheritance
+	}
+	return nil
+}
+
 func (cfg *CFG) processSection(section_name string, remainder string, comment []string, inheritance_map map[*CFG]string) (*CFG, error) {
-	if cfg.Exists(section_name) {
+	if ocfg, opt := cfg.getString(section_name, false, 0); ocfg != nil || opt != nil {
 		return nil, errors.New(fmt.Sprintf("Section %s defined under %s is already defined", section_name, cfg.Path()))
 	}
-	subCfg := NewCFG()
-	cfg.sections[section_name] = subCfg
-	subCfg.root = cfg.root
-	subCfg.parent = cfg
-	subCfg.comment = strings.Join(comment, "\n")
-	cfg.order = append(cfg.order, section_name)
+	subCfg, err := cfg.CreateSection(section_name, strings.Join(comment, "\n"))
+	if err != nil {
+		return subCfg, err
+	}
 	//Check if inheritance is defined
 	remainder = strings.Trim(remainder, trimChars)
 	if len(remainder) > 0 {
@@ -88,37 +227,29 @@ func (cfg *CFG) processOption(parsedData []rune, opt_value string, comment []str
 	switch parsedData[len(parsedData)-1] {
 	case '+':
 		opt_name := strings.Trim(string(parsedData[:len(parsedData)-1]), trimChars)
-		if opt_data, ok := cfg.options[opt_name]; ok {
+		if _, opt := cfg.getString(opt_name, false, 0); opt != nil {
 			//Option is previously defined, so ok
-			opt_data.value = append(opt_data.value, opt_value)
+			opt.value = append(opt.value, opt_value)
 		} else {
 			//Oops. Trying to append to a non existant option!
 			return errors.New("Option " + opt_name + " was not previously defined")
 		}
 	default:
 		opt_name := strings.Trim(string(parsedData), trimChars)
-		if cfg.Exists(opt_name) {
+		if sec, opt := cfg.getString(opt_name, false, 0); sec != nil || opt != nil {
 			return errors.New(opt_name + " already exists")
 		}
-		//It is a new option
-		cfg.options[opt_name] = &option{value: []string{opt_value},
-			comment: strings.Join(comment, "\n")}
-		cfg.order = append(cfg.order, opt_name)
+		return cfg.SetOptionArray(opt_name, []string{opt_value}, strings.Join(comment, splitChar))
 	}
 	return nil
 }
 
-//load the contents of a reader into this CFG. This method fails if something gets overwritten
-func (cfg *CFG) LoadFromReader(r io.Reader) (err error) {
-	return cfg.loadFromReader(bufio.NewReader(r), 0)
-}
-
-func (cfg *CFG) loadFromReader(source *bufio.Reader, line_counter uint32) (err error) {
+func (cfg *CFG) loadFromReader(source *bufio.Reader, line_counter uint32, inheritance_map map[*CFG]string) (err error) {
 	comment := make([]string, 0)
 	line := ""
 	parsedData := make([]rune, 0, 128)
-	inheritance_map := make(map[*CFG]string)
-	for ; err == nil; line, err = source.ReadString('\n') {
+	for err == nil {
+		line, err = source.ReadString('\n')
 		line_counter++
 		commentPos := strings.IndexRune(line, '#')
 		if commentPos > -1 {
@@ -140,10 +271,13 @@ func (cfg *CFG) loadFromReader(source *bufio.Reader, line_counter uint32) (err e
 				if err != nil {
 					return errors.New(fmt.Sprintf("%s (line %v)", err.Error(), line_counter))
 				}
-				err = subCfg.loadFromReader(source, line_counter)
+				err = subCfg.loadFromReader(source, line_counter, inheritance_map)
 				if err != nil {
 					return err
 				}
+				comment = comment[:0]
+				parsedData = parsedData[:0]
+				break NextLineBreak
 			case '}':
 				return nil
 			case '=':
@@ -189,10 +323,11 @@ func (cfg *CFG) Path() string {
 
 //Get the root of the cfg
 func (cfg *CFG) Root() *CFG {
-	if cfg.root != nil {
-		return cfg.root
+	root := cfg
+	for root.parent != nil {
+		root = root.parent
 	}
-	return cfg
+	return root
 }
 
 /* inner gets */
@@ -262,8 +397,39 @@ func (cfg *CFG) getOption(name string, follow_inheritance bool) (*option, bool) 
 	return nil, false
 }
 
+//Creates a section.Does not create all the intermediate ones and does not overwrite if there's one already present
+func (cfg *CFG) CreateSection(name string, comment string) (*CFG, error) {
+	cfg.Root().lock.Lock()
+	defer cfg.Root().lock.Unlock()
+	p := SplitPath(name)
+	var parentCfg *CFG
+	switch len(p) {
+	case 0:
+		return nil, errors.New("What's the name of the section?")
+	case 1:
+		parentCfg = cfg
+	default:
+		parentCfg, _ := cfg.get(p, false, 1)
+		if parentCfg == nil {
+			return nil, errors.New("Parent section for " + strings.Join(p, "\n") + " does not exist")
+		}
+	}
+	if _, ok := parentCfg.sections[p[0]]; ok {
+		return nil, errors.New("Section " + p[0] + " already exists")
+	}
+	section_name := p[len(p)-1]
+	subCfg := newCFG()
+	parentCfg.sections[section_name] = subCfg
+	parentCfg.order = append(parentCfg.order, section_name)
+	subCfg.parent = parentCfg
+	subCfg.comment = comment
+	return subCfg, nil
+}
+
 //Set an option value. This overwrites if it exists
 func (cfg *CFG) SetOptionArray(name string, value []string, comment string) error {
+	cfg.Root().lock.Lock()
+	defer cfg.Root().lock.Unlock()
 	p := SplitPath(name)
 	pcfg := cfg
 	var opt *option
@@ -282,6 +448,7 @@ func (cfg *CFG) SetOptionArray(name string, value []string, comment string) erro
 		opt = new(option)
 		opt_name := p[len(p)-1]
 		pcfg.options[opt_name] = opt
+		pcfg.order = append(cfg.order, opt_name)
 	}
 	opt.comment = comment
 	opt.value = value
@@ -323,4 +490,84 @@ func (cfg *CFG) GetValueArray(name string, defaultValue []string) []string {
 		return v
 	}
 	return defaultValue
+}
+
+//Clone a CFG. If it's not the root one it will just dup from that section downwards. Upper inheritance links will still point to their original sources. Lower ones will point to the new created sections
+func (cfg *CFG) Clone() (dup *CFG, err error) {
+	dup = newCFG()
+	if cfg.parent == nil {
+		dup.lock = new(sync.Mutex)
+	} else {
+		dup.parent = cfg.parent
+	}
+	var buf bytes.Buffer
+	if err = cfg.DumpToWriter(&buf); err != nil {
+		return
+	}
+	err = dup.LoadFromReader(&buf)
+	return
+}
+
+//Are the two CFGs equal (including comments)
+func (cfg *CFG) RealEqual(other *CFG) bool {
+	return cfg.equal(other, true)
+}
+
+//Are the two CFGs equal (NOT including comments)
+func (cfg *CFG) Equal(other *CFG) bool {
+	return cfg.equal(other, false)
+}
+
+func (cfg *CFG) equal(other *CFG, with_comments bool) bool {
+	if with_comments && cfg.comment != other.comment {
+		return false
+	}
+	if len(cfg.order) != len(other.order) {
+		return false
+	}
+	switch {
+	case cfg.inheritance != nil:
+		if other.inheritance == nil {
+			return false
+		}
+		if cfg.inheritance.Path() != other.inheritance.Path() {
+			return false
+		}
+	default:
+		if other.inheritance != nil {
+			return false
+		}
+	}
+	for iPos, name := range cfg.order {
+		if other.order[iPos] != name {
+			return false
+		}
+		if sec, ok := cfg.sections[name]; ok {
+			if other_sec, ok2 := other.sections[name]; ok2 {
+				if !sec.equal(other_sec, with_comments) {
+					return false
+				}
+			} else {
+				return false
+			}
+		}
+		if opt, ok := cfg.options[name]; ok {
+			if other_opt, ok2 := other.options[name]; ok2 {
+				if with_comments && opt.comment != other_opt.comment {
+					return false
+				}
+				if len(opt.value) != len(other_opt.value) {
+					return false
+				}
+				for vPos, val := range opt.value {
+					if other_opt.value[vPos] != val {
+						return false
+					}
+				}
+			} else {
+				return false
+			}
+		}
+	}
+	return true
 }
