@@ -13,7 +13,7 @@ import (
 )
 
 const trimChars = " \n\r\t"
-const splitChar = "/"
+const SplitChar = "/"
 
 type option struct {
 	value   []string
@@ -68,8 +68,9 @@ func NewCFGFromReader(r io.Reader) (cfg *CFG, err error) {
 	return
 }
 
+//This will split a string into an array of trimmed not empty strings separated by SplitChar
 func SplitPath(path string) []string {
-	p := strings.Split(path, splitChar)
+	p := strings.Split(path, SplitChar)
 	current := 0
 	for iP, iC := range p {
 		if iC == "" {
@@ -185,21 +186,31 @@ func (cfg *CFG) resetInheritance() {
 
 //Define an inheritance section for this cfg. That means that any time that an option or section is retrieved, if this cfg does not have it it will check the inheritance one
 func (cfg *CFG) SetInheritance(inheritance string) error {
+	if cfg.parent == nil {
+		return errors.New("Root node cannot inherit from anyone")
+	}
 	incfg, _ := cfg.Root().getString(inheritance, false, 0)
 	myPath := cfg.Path()
 	if incfg == nil {
 		return errors.New(fmt.Sprintf("Inheritance section %s for section %s does not exist", inheritance, myPath))
 	}
-	cfg.inheritance = incfg
-	path := []string{myPath, incfg.Path()}
-	search := incfg.inheritance
-	for search != nil {
-		path = append(path, search.Path())
-		if search == cfg {
+	path := []string{myPath}
+	current := incfg
+	for current != nil {
+		currentPath := current.Path()
+		path = append(path, currentPath)
+		if current == cfg {
 			return errors.New("Circular inheritance loop found: " + strings.Join(path, " < "))
 		}
-		search = search.inheritance
+		for parent := cfg.parent; parent != nil; parent = parent.parent {
+			if parent == current {
+				return errors.New("Cannot inherit from a direct parent to prevent recursive loops (" + currentPath + " is parent of " + myPath + ")")
+			}
+		}
+
+		current = current.inheritance
 	}
+	cfg.inheritance = incfg
 	return nil
 }
 
@@ -207,7 +218,7 @@ func (cfg *CFG) processSection(section_name string, remainder string, comment []
 	if ocfg, opt := cfg.getString(section_name, false, 0); ocfg != nil || opt != nil {
 		return nil, errors.New(fmt.Sprintf("Section %s defined under %s is already defined", section_name, cfg.Path()))
 	}
-	subCfg, err := cfg.CreateSection(section_name, strings.Join(comment, "\n"))
+	subCfg, err := cfg.createSection(section_name, strings.Join(comment, "\n"))
 	if err != nil {
 		return subCfg, err
 	}
@@ -239,7 +250,7 @@ func (cfg *CFG) processOption(parsedData []rune, opt_value string, comment []str
 		if sec, opt := cfg.getString(opt_name, false, 0); sec != nil || opt != nil {
 			return errors.New(opt_name + " already exists")
 		}
-		return cfg.SetOptionArray(opt_name, []string{opt_value}, strings.Join(comment, splitChar))
+		return cfg.SetOptionArray(opt_name, []string{opt_value}, strings.Join(comment, SplitChar))
 	}
 	return nil
 }
@@ -307,7 +318,7 @@ func (cfg *CFG) Path() string {
 		lvls++
 	}
 	if lvls == 0 {
-		return splitChar
+		return SplitChar
 	}
 	path := make([]string, lvls)
 	for i, me := lvls-1, cfg; i > -1; i, me = i-1, me.parent {
@@ -318,7 +329,7 @@ func (cfg *CFG) Path() string {
 			}
 		}
 	}
-	return strings.Join(path, splitChar)
+	return strings.Join(path, SplitChar)
 }
 
 //Get the root of the cfg
@@ -332,20 +343,20 @@ func (cfg *CFG) Root() *CFG {
 
 /* inner gets */
 func (cfg *CFG) getString(path string, follow_inheritance bool, parent_lvl int) (*CFG, *option) {
-	return cfg.get(strings.Split(path, splitChar), follow_inheritance, parent_lvl)
+	return cfg.get(strings.Split(path, SplitChar), follow_inheritance, parent_lvl)
 }
 
 func (cfg *CFG) get(path []string, follow_inheritance bool, parent_lvl int) (*CFG, *option) {
 	switch {
 	case len(path) > 1+parent_lvl:
-		if subCfg, ok := cfg.getSection(path[0], follow_inheritance); ok {
-			return subCfg.get(path[1:], follow_inheritance, parent_lvl)
+		if sec := cfg.getSection(path[0], follow_inheritance); sec != nil {
+			return sec.get(path[1:], follow_inheritance, parent_lvl)
 		}
 	case len(path) == 1+parent_lvl:
-		if sec, ok := cfg.getSection(path[0], follow_inheritance); ok {
+		if sec := cfg.getSection(path[0], follow_inheritance); sec != nil {
 			return sec, nil
 		}
-		if opt, ok := cfg.getOption(path[0], follow_inheritance); ok {
+		if opt := cfg.getOption(path[0], follow_inheritance); opt != nil {
 			return nil, opt
 		}
 	}
@@ -377,30 +388,34 @@ func (cfg *CFG) GetSection(name string) (*CFG, bool) {
 }
 
 /* Real getters*/
-func (cfg *CFG) getSection(name string, follow_inheritance bool) (*CFG, bool) {
+func (cfg *CFG) getSection(name string, follow_inheritance bool) *CFG {
 	if sec, ok := cfg.sections[name]; ok {
-		return sec, true
+		return sec
 	}
 	if follow_inheritance && cfg.inheritance != nil {
 		return cfg.inheritance.getSection(name, true)
 	}
-	return nil, false
+	return nil
 }
 
-func (cfg *CFG) getOption(name string, follow_inheritance bool) (*option, bool) {
+func (cfg *CFG) getOption(name string, follow_inheritance bool) *option {
 	if opt, ok := cfg.options[name]; ok {
-		return opt, true
+		return opt
 	}
 	if follow_inheritance && cfg.inheritance != nil {
 		return cfg.inheritance.getOption(name, true)
 	}
-	return nil, false
+	return nil
 }
 
 //Creates a section.Does not create all the intermediate ones and does not overwrite if there's one already present
 func (cfg *CFG) CreateSection(name string, comment string) (*CFG, error) {
 	cfg.Root().lock.Lock()
 	defer cfg.Root().lock.Unlock()
+	return cfg.createSection(name, comment)
+}
+
+func (cfg *CFG) createSection(name string, comment string) (*CFG, error) {
 	p := SplitPath(name)
 	var parentCfg *CFG
 	switch len(p) {
@@ -441,7 +456,7 @@ func (cfg *CFG) SetOptionArray(name string, value []string, comment string) erro
 	default:
 		pcfg, opt = cfg.get(p, false, 1)
 		if pcfg == nil {
-			return errors.New(fmt.Sprintf("Parent %s section does not exist", strings.Join(p[:len(p)-1], splitChar)))
+			return errors.New(fmt.Sprintf("Parent %s section does not exist", strings.Join(p[:len(p)-1], SplitChar)))
 		}
 	}
 	if opt == nil {
@@ -471,7 +486,7 @@ func (cfg *CFG) GetOptionArray(name string) ([]string, bool) {
 //Get option value as a string
 func (cfg *CFG) GetOption(name string) (string, bool) {
 	if _, opt := cfg.getString(name, true, 0); opt != nil {
-		return strings.Join(opt.value, splitChar), true
+		return strings.Join(opt.value, SplitChar), true
 	}
 	return "", false
 }
@@ -570,4 +585,85 @@ func (cfg *CFG) equal(other *CFG, with_comments bool) bool {
 		}
 	}
 	return true
+}
+
+//Get a channel that will iterate over all direct child options
+func (cfg *CFG) ListOptions() <-chan string {
+	c := make(chan string)
+	go func() {
+		defer close(c)
+		me := cfg
+		found := make(map[string]bool)
+		for me != nil {
+			for name, _ := range me.options {
+				if _, ok := found[name]; !ok {
+					found[name] = true
+					c <- name
+				}
+			}
+			me = me.inheritance
+		}
+	}()
+	return c
+}
+
+//Get a channel that will iterate over all direct child sections
+func (cfg *CFG) ListSections() <-chan string {
+	c := make(chan string)
+	go func() {
+		defer close(c)
+		me := cfg
+		found := make(map[string]bool)
+		for me != nil {
+			for name, _ := range me.sections {
+				if _, ok := found[name]; !ok {
+					found[name] = true
+					c <- name
+				}
+			}
+			me = me.inheritance
+		}
+	}()
+	return c
+}
+
+//Insert the contents of the "in" CFG into the current one
+func (cfg *CFG) InsertContents(in *CFG) (err error) {
+	cfg.Root().lock.Lock()
+	defer cfg.Root().lock.Unlock()
+	return cfg.insertContents(in)
+}
+
+func (cfg *CFG) insertContents(in *CFG) (err error) {
+	for opt_name := range in.ListOptions() {
+		in_opt := in.getOption(opt_name, true)
+		if in_opt == nil {
+			return errors.New("Oops. Something changed while we were merging!")
+		}
+		opt := new(option)
+		opt.comment = in_opt.comment
+		opt.value = make([]string, len(in_opt.value))
+		copy(opt.value, in_opt.value)
+		if _, ok := cfg.options[opt_name]; !ok {
+			cfg.order = append(cfg.order, opt_name)
+		}
+		cfg.options[opt_name] = opt
+	}
+	for sec_name := range in.ListSections() {
+		var sec *CFG
+		var ok bool
+		in_sec := in.getSection(sec_name, true)
+		if in_sec == nil {
+			return errors.New("Oops. Something changed while we were merging!")
+		}
+		if sec, ok = cfg.sections[sec_name]; !ok {
+			sec, err = cfg.createSection(sec_name, in_sec.comment)
+		} else {
+			sec.comment = in_sec.comment
+		}
+		if err := sec.insertContents(in_sec); err != nil {
+			return err
+		}
+	}
+	return nil
 }

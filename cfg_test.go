@@ -38,32 +38,37 @@ func TestLoadErrors(t *testing.T) {
 	data = "a { crap\n}"
 	expected = "Expected inheriting section defined with '< section_name' but 'crap' found (line 1)"
 	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
-		t.Error("Didn't receive expected error: ", err)
+		t.Error("Didn't receive expected error:", err)
 	}
 	data = "a=1\na=1"
 	expected = "a already exists (line 2)"
 	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
-		t.Error("Didn't receive expected error: ", err)
+		t.Error("Didn't receive expected error:", err)
 	}
 	data = "a=1\nb+=1"
 	expected = "Option b was not previously defined (line 2)"
 	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
-		t.Error("Didn't receive expected error: ", err)
+		t.Error("Didn't receive expected error:", err)
 	}
 	data = "s{\na=1\nb+=1\n"
 	expected = "Option b was not previously defined (line 3)"
 	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
-		t.Error("Didn't receive expected error: ", err)
+		t.Error("Didn't receive expected error:", err)
 	}
 	data = "s{\n}\ns2{<a\n}"
 	expected = "Inheritance section a for section s2 does not exist"
 	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
-		t.Error("Didn't receive expected error: ", err)
+		t.Error("Didn't receive expected error:", err)
 	}
-	data = "s1{<s3\n}\ns2{\ns21{<s1\n}\n}\ns3{<s2/s21\n}"
-	expected = "Circular inheritance loop found: s3 < s2/s21 < s1 < s3"
+	data = "s1{<s3\n}\ns2{<s1\n}\ns3{<s2\n}"
+	expected = "Circular inheritance loop found: s3 < s2 < s1 < s3"
 	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
-		t.Error("Didn't receive expected error: ", err)
+		t.Error("Didn't receive expected error:", err)
+	}
+	data = "s1 {\n}\ns2 {<s1\ns21{<s2/s21/s211\ns211{<s2\n}\n}\n}\n"
+	expected = "Cannot inherit from a direct parent to prevent recursive loops (s2 is parent of s2/s21/s211)"
+	if _, err := NewCFGFromString(data); err == nil || err.Error() != expected {
+		t.Error("Didn't receive expected error:", err)
 	}
 }
 
@@ -117,15 +122,13 @@ func TestFromFile(t *testing.T) {
 	if err == nil {
 		t.Error("Didn't complain when opening a non existant file")
 	}
-	cfg, err := NewCFGFromFile("example.cfg")
-	if err != nil {
+	if _, err := NewCFGFromFile("examples/simple.cfg"); err != nil {
 		t.Error(err)
 	}
-	cfg.Root()
 }
 
 func TestCloneEqual(t *testing.T) {
-	data := "s1 {\nop1 = val1\nop1 += val1a\n}\ns2 {<s1\ns21{<s2\nop211=val211\n}\ns22{\n}\n}\nop1=a"
+	data := "s1 {\nop1 = val1\nop1 += val1a\n}\ns2 {<s1\ns21{\nop211=val211\n}\ns22{\n}\n}\nop1=a"
 	cfg, err := NewCFGFromString(data)
 	if err != nil {
 		t.Error(err)
@@ -140,7 +143,7 @@ func TestCloneEqual(t *testing.T) {
 }
 
 func TestExists(t *testing.T) {
-	data := "s1 {\nop1 = val1\nop1 += val1a\n}\ns2 {<s1\ns21{<s2\nop211=val211\n}\ns22{\n}\n}\nop1=a"
+	data := "s1 {\nop1 = val1\nop1 += val1a\n}\ns2 {<s1\ns21{\nop211=val211\n}\ns22{\n}\n}\nop1=a"
 	cfg, err := NewCFGFromString(data)
 	if err != nil {
 		t.Error("Error wile loading CFG: " + err.Error())
@@ -163,17 +166,39 @@ func TestExists(t *testing.T) {
 	if cfg.Exists("s0") {
 		t.Error("Section exists")
 	}
-	if !cfg.Exists("s2/s21/s22") {
-		t.Error("Section does not exist")
-	}
 	if !cfg.Exists("s1/op1") {
 		t.Error("Option doesn't exist")
 	}
-	if !cfg.Exists("s2/s21/op1") {
+	if !cfg.Exists("s2/op1") {
 		t.Error("Option doesn't exist")
 	}
 	if !cfg.ExistsOption("op1") {
 		t.Error("Option doesn't exist")
 	}
+}
 
+func TestInsertContents(t *testing.T) {
+	data1 := "s2 {\ns21{\nop211=a\n}\ns22{\n}\n}\ns3{<s2\nop3=b\n}"
+	data2 := "s1 {\nop1 = val1\nop1 += val1a\n}\ns2 {<s1\ns21{\nop211=val211\n}\ns22{\n}\n}\nop1=a"
+	var cfg, in_cfg *CFG
+	var err error
+	cfg, err = NewCFGFromString(data1)
+	if err != nil {
+		t.Error(err)
+	}
+	in_cfg, err = NewCFGFromString(data2)
+	if err != nil {
+		t.Error(err)
+	}
+	if err = cfg.InsertContents(in_cfg); err != nil {
+		t.Error(err)
+	}
+	expected := "s2 {\n\ts21 {\n\t\top211 = val211\n\t}\n\ts22 {\n\t}\n\top1 = val1\n\top1 += val1a\n}\ns3 {< s2\n\top3 = b\n}\nop1 = a\ns1 {\n\top1 = val1\n\top1 += val1a\n}\n"
+	if expected_cfg, err := NewCFGFromString(expected); err != nil {
+		t.Error(err)
+	} else {
+		if !expected_cfg.Equal(cfg) {
+			t.Error("Merge didn't go as expected")
+		}
+	}
 }
